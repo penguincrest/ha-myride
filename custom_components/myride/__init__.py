@@ -35,6 +35,32 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORMS = [Platform.SENSOR, Platform.DEVICE_TRACKER]
 
 
+def _parse_live_time(value: Any) -> Optional[datetime]:
+    """Parse a SignalR timestamp into a local, timezone-aware datetime.
+
+    The live vehicle hub sends UTC timestamps, often without an offset
+    (e.g. "2026-11-09T14:05:13" for 9:05 AM US/Eastern), so naive values are
+    treated as UTC. The result is converted to local time so the wall-clock
+    hour/minute comparisons used elsewhere in the integration stay correct.
+    """
+    if not value:
+        return None
+    try:
+        parsed = dt_util.parse_datetime(str(value))
+    except ValueError:
+        return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt_util.UTC)
+    return dt_util.as_local(parsed)
+
+
+def _minutes_until(target: datetime, now: datetime) -> int:
+    """Whole minutes from now until target, never negative."""
+    return max(0, int((target - now).total_seconds() / 60.0))
+
+
 def _async_migrate_entity_ids(hass: HomeAssistant, entry: ConfigEntry, students: list) -> None:
     """Migrate entity IDs to clean _am / _pm suffixes, eliminating _2 collisions."""
     try:
@@ -383,21 +409,20 @@ class MyRideDataUpdateCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             
         _LOGGER.debug("Received live ETA for run %s stop %s", run_id, stop_id)
         
-        # Calculate new eta_minutes
+        # Normalize to local time (the hub sends UTC) and calculate eta_minutes
         try:
-            eta_dt = dt_util.parse_datetime(eta_str)
+            eta_dt = _parse_live_time(eta_str)
             if not eta_dt:
                 return
-            now = dt_util.now()
-            # If naive, localize
-            if eta_dt.tzinfo is None:
-                eta_dt = eta_dt.replace(tzinfo=now.tzinfo)
-            # Calculate difference in minutes
-            diff = (eta_dt - now).total_seconds() / 60.0
-            eta_minutes = max(0, int(diff))
+            eta_minutes = _minutes_until(eta_dt, dt_util.now())
         except Exception as err:
             _LOGGER.error("Failed to parse live ETA time: %s", err)
             return
+
+        eta_str = eta_dt.isoformat()
+        planned_dt = _parse_live_time(planned_str)
+        if planned_dt:
+            planned_str = planned_dt.isoformat()
 
         # Store in persistent self.live_etas map so REST polls don't erase it
         eta_key = f"{run_id}_{stop_id}"
@@ -446,6 +471,13 @@ class MyRideDataUpdateCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         except (MyRideAuthError, MyRideAPIError) as err:
             raise UpdateFailed(f"Failed to communicate with My Ride K-12 API: {err}") from err
 
+        # Drop live ETAs from a previous day so they don't outlive their run
+        today = dt_util.as_local(now).date()
+        for eta_key in list(self.live_etas):
+            eta_dt = _parse_live_time(self.live_etas[eta_key].get("eta"))
+            if eta_dt is None or eta_dt.date() != today:
+                del self.live_etas[eta_key]
+
         # Re-apply any live ETAs from SignalR that are currently stored
         for student in students:
             run_info = get_field(student, "runInfo", [])
@@ -457,6 +489,10 @@ class MyRideDataUpdateCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
                     eta_key = f"{r_id}_{s_id}"
                     if eta_key in self.live_etas:
                         live_info = self.live_etas[eta_key]
+                        # Refresh the countdown; it was frozen when the ETA arrived
+                        eta_dt = _parse_live_time(live_info["eta"])
+                        if eta_dt is not None:
+                            live_info["eta_minutes"] = _minutes_until(eta_dt, now)
                         stop["stopTime"] = live_info["eta"]
                         stop["etaMinutes"] = live_info["eta_minutes"]
                         stop["tylerEta"] = live_info["eta"]

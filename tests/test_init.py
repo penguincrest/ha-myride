@@ -1,5 +1,6 @@
+import copy
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, AsyncMock, patch
 from custom_components.myride import MyRideDataUpdateCoordinator
 from custom_components.myride.api import MyRideAPIError, MyRideAuthError
@@ -177,23 +178,113 @@ async def test_coordinator_live_eta_preservation():
     coordinator.data = {"students": [], "buses": [], "has_active_run": False}
 
     # Simulate live ETA arrival over SignalR
+    dt_util.set_default_time_zone(dt_util.UTC)
     mock_now = datetime(2026, 8, 24, 7, 50, 0, tzinfo=dt_util.UTC)
-    with patch("homeassistant.util.dt.now", return_value=mock_now):
-        coordinator._handle_new_eta({
-            "RunId": 999,
-            "StopId": 501,
-            "Eta": "2026-08-24T08:05:00Z",
-            "PlannedTime": "2026-08-24T08:00:00Z",
-        })
+    try:
+        with patch("homeassistant.util.dt.now", return_value=mock_now):
+            coordinator._handle_new_eta({
+                "RunId": 999,
+                "StopId": 501,
+                "Eta": "2026-08-24T08:05:00Z",
+                "PlannedTime": "2026-08-24T08:00:00Z",
+            })
 
-        # REST poll runs
-        data = await coordinator._async_update_data()
+            # REST poll runs
+            data = await coordinator._async_update_data()
 
-        # Stop should retain live ETA rather than being overwritten by static REST data
-        stop = data["students"][0]["RunInfo"][0]["StopsInfo"][0]
-        assert stop["stopTime"] == "2026-08-24T08:05:00Z"
-        assert stop["tylerEta"] == "2026-08-24T08:05:00Z"
-        assert stop["etaMinutes"] == 15
+            # Stop should retain live ETA rather than being overwritten by static REST data
+            stop = data["students"][0]["RunInfo"][0]["StopsInfo"][0]
+            assert stop["stopTime"] == "2026-08-24T08:05:00+00:00"
+            assert stop["tylerEta"] == "2026-08-24T08:05:00+00:00"
+            assert stop["etaMinutes"] == 15
+    finally:
+        dt_util.set_default_time_zone(None)
+
+
+def _single_stop_api(stop_time: str) -> MagicMock:
+    """API mock returning a fresh copy of one student with one run and one stop on each poll."""
+    students = [
+        {
+            "StudentId": 111,
+            "RunInfo": [
+                {
+                    "RunId": 999,
+                    "ActiveVehicle": "BUS42",
+                    "Days": "MTWRF",
+                    "RunningDays": [],
+                    "StopsInfo": [
+                        {"StopId": 501, "StopTime": stop_time, "PlannedStopTime": stop_time}
+                    ],
+                }
+            ],
+        }
+    ]
+    mock_api = MagicMock()
+    mock_api.async_get_students = AsyncMock(side_effect=lambda: copy.deepcopy(students))
+    mock_api.async_get_buses = AsyncMock(return_value=[])
+    return mock_api
+
+
+@pytest.mark.asyncio
+async def test_coordinator_live_eta_naive_utc_converted_to_local():
+    """A naive live ETA from the hub is UTC and is stored as local, offset-aware time."""
+    eastern = timezone(timedelta(hours=-5))
+    coordinator = MyRideDataUpdateCoordinator(
+        MagicMock(), _single_stop_api("1900-01-01T09:00:00"), "test@example.com", "password"
+    )
+    coordinator.data = {"students": [], "buses": [], "has_active_run": False}
+
+    dt_util.set_default_time_zone(eastern)
+    # 8:50 AM Eastern; hub reports the stop ETA as 14:05:13 UTC (9:05:13 AM Eastern)
+    mock_now = datetime(2026, 11, 9, 8, 50, 0, tzinfo=eastern)
+    try:
+        with patch("homeassistant.util.dt.now", return_value=mock_now):
+            coordinator._handle_new_eta({
+                "RunId": 999,
+                "StopId": 501,
+                "Eta": "2026-11-09T14:05:13",
+                "PlannedTime": "2026-11-09T14:01:00",
+            })
+            live = coordinator.live_etas["999_501"]
+            assert live["eta"] == "2026-11-09T09:05:13-05:00"
+            assert live["planned_time"] == "2026-11-09T09:01:00-05:00"
+            assert live["eta_minutes"] == 15
+
+            data = await coordinator._async_update_data()
+            stop = data["students"][0]["RunInfo"][0]["StopsInfo"][0]
+            assert stop["tylerEta"] == "2026-11-09T09:05:13-05:00"
+            assert stop["etaMinutes"] == 15
+    finally:
+        dt_util.set_default_time_zone(None)
+
+
+@pytest.mark.asyncio
+async def test_coordinator_live_eta_countdown_refreshes_and_prunes_stale():
+    """Stored ETAs count down on each poll and are dropped once they belong to a past day."""
+    eastern = timezone(timedelta(hours=-5))
+    coordinator = MyRideDataUpdateCoordinator(
+        MagicMock(), _single_stop_api("1900-01-01T09:00:00"), "test@example.com", "password"
+    )
+    coordinator.data = {"students": [], "buses": [], "has_active_run": False}
+
+    dt_util.set_default_time_zone(eastern)
+    try:
+        with patch("homeassistant.util.dt.now", return_value=datetime(2026, 11, 9, 8, 50, tzinfo=eastern)):
+            coordinator._handle_new_eta({"RunId": 999, "StopId": 501, "Eta": "2026-11-09T14:05:00"})
+
+        # Ten minutes later the countdown is recomputed, not frozen at 15
+        with patch("homeassistant.util.dt.now", return_value=datetime(2026, 11, 9, 9, 0, tzinfo=eastern)):
+            data = await coordinator._async_update_data()
+            assert data["students"][0]["RunInfo"][0]["StopsInfo"][0]["etaMinutes"] == 5
+
+        # Next morning the old ETA is pruned and the planned time is used again
+        with patch("homeassistant.util.dt.now", return_value=datetime(2026, 11, 10, 8, 0, tzinfo=eastern)):
+            data = await coordinator._async_update_data()
+            assert "999_501" not in coordinator.live_etas
+            stop = data["students"][0]["RunInfo"][0]["StopsInfo"][0]
+            assert stop.get("tylerEta") is None
+    finally:
+        dt_util.set_default_time_zone(None)
 
 @pytest.mark.asyncio
 async def test_async_migrate_entity_ids():
