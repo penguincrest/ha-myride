@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
-from homeassistant.components.device_tracker.config_entry import TrackerEntity
+from homeassistant.components.device_tracker import TrackerEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
